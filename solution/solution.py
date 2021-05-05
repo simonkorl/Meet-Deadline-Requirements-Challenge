@@ -13,6 +13,89 @@ EVENT_TYPE_TEMP='T'
 
 MAX_BW = 200.0 * 1000 * 1000 * 8
 MAX_PRIO = 3
+FRACTIONS = [128, 139, 152, 165, 181, 197, 215, 234]
+
+class Hybla:
+    def hybla_init(self, solution):
+        self.RTT0: float = 0.025 # reference rout trip time 25ms
+        self.rho: int = 0
+        self.rho2: int = 0
+        self.rho_3ls: int = 0
+        self.rho2_7ls: int = 0
+        self.snd_cwnd_cents: int = 0
+        self.hybla_en = True
+        solution.cwnd = 2
+        solution.cwnd_cnt = 0
+        solution.cwnd_clamp = 65535
+        
+        self.hybla_recalc_param(solution)
+        
+        if solution.rtt > 0:
+            self.minrtt: float = solution.rtt # Minimum srtt
+        else:
+            self.minrtt = float("inf")
+        solution.cwnd = self.rho
+
+        self.back_state = 0
+        self.back_conf = 10
+    
+    def hybla_state(self, new_state):
+        self.hybla_en = (new_state == "congestion_avoidance")
+        
+    def hybla_recalc_param(self, solution):
+        # solution: MySolution
+        self.rho_3ls = max(int(solution.rtt / self.RTT0), 8)
+        self.rho = int(self.rho_3ls >> 3)
+        self.rho2_7ls = int((self.rho_3ls * self.rho_3ls) << 1)
+        self.rho2 = int(self.rho2_7ls >> 7)
+        print(self.rho_3ls, self.rho)
+
+    def hybla_fraction(self, odds: int) -> int:
+        return FRACTIONS[odds] if (odds < len(FRACTIONS)) else 128
+
+    def hybla_cong_avoid(self, solution, cur_time, event_info):
+        ca = self
+        increment: int = 0
+        odd: int = 0
+        rho_fractions: int = 0
+        is_slowstart = 0
+
+        if solution.rtt < ca.minrtt:
+            self.hybla_recalc_param(solution)
+            ca.minrtt = solution.rtt
+
+        if ca.rho == 0:
+            self.hybla_recalc_param(solution)
+
+        rho_fractions = ca.rho_3ls - (ca.rho << 3)
+        
+        if solution.curr_state == solution.states[0]:
+            # slow start
+            is_slowstart = 1
+            increment = ((1 << min(ca.rho, 16)) * self.hybla_fraction(rho_fractions)) - 128
+        else:
+            # CA
+            increment = ca.rho2_7ls / solution.cwnd
+            if increment < 128:
+                solution.cwnd_cnt += 1
+
+        odd = increment % 128
+        solution.cwnd += increment // 2**7
+        ca.snd_cwnd_cents += odd
+
+        while ca.snd_cwnd_cents >= 128:
+            solution.cwnd += 1
+            ca.snd_cwnd_cents -= 128
+            solution.cwnd_cnt = 0
+
+        if increment == 0 and odd == 0 and solution.cwnd_cnt >= solution.cwnd:
+            solution.cwnd += 1
+            solution.cwnd_cnt = 0
+
+        if is_slowstart:
+            solution.cwnd = int(min(solution.cwnd, solution.ssthresh))
+
+        solution.cwnd = min(int(solution.cwnd), solution.cwnd_clamp)
 # Your solution should include block selection and bandwidth estimator.
 # We recommend you to achieve it by inherit the objects we provided and overwritten necessary method.
 class MySolution(BlockSelection, CongestionControl):
@@ -60,6 +143,10 @@ class MySolution(BlockSelection, CongestionControl):
         self.ddl = 0
         self.size = 0
         self.prio = -1
+
+        # hybla
+        self.hybla = Hybla()
+        self.hybla.hybla_init(self)
 
     def select_block(self, cur_time, block_queue):
         '''
@@ -141,7 +228,11 @@ class MySolution(BlockSelection, CongestionControl):
                 return
             self.instant_drop_nums += 1
             # step into fast recovery state
-            self.curr_state = self.states[2]
+            if self.hybla.back_state < self.hybla.back_conf:
+                self.hybla.back_state += 1
+            else:
+                self.hybla.back_state = 0
+                self.curr_state = self.states[2]
             self.drop_nums += 1
             # clear acknowledgement count
             self.ack_nums = 0
@@ -169,22 +260,30 @@ class MySolution(BlockSelection, CongestionControl):
             else:
                 self.rtt = self.rtt * 0.8 + event_info["packet_information_dict"]["Latency"] * 0.2
             self.rtt_update_time = event_time
-            # print(self.rtt)
+            if self.rtt < self.hybla.minrtt:
+                self.hybla.minrtt = self.rtt
+                self.hybla.hybla_recalc_param(self)
+
             self.interval_pkt_num += 1
+
+            if self.hybla.back_state > 0:
+                self.hybla.back_state -= 1
             # double cwnd in slow_start state
             if self.curr_state == self.states[0]:
-                if self.ack_nums == self.cwnd:
-                    self.cwnd *= 2
-                    self.ack_nums = 0
+                self.hybla.hybla_cong_avoid(self, cur_time, event_info)
+                # if self.ack_nums == self.cwnd:
+                #     self.cwnd *= 2**(self.hybla.rho)
+                #     self.ack_nums = 0
                 # step into congestion_avoidance state due to exceeding threshhold
                 if self.cwnd >= self.ssthresh:
                     self.curr_state = self.states[1]
 
             # increase cwnd linearly in congestion_avoidance state
             elif self.curr_state == self.states[1]:
-                if self.ack_nums == self.cwnd:
-                    self.cwnd += 1
-                    self.ack_nums = 0
+                self.hybla.hybla_cong_avoid(self, cur_time, event_info)
+                # if self.ack_nums == self.cwnd:
+                #     self.cwnd += self.hybla.rho2
+                #     self.ack_nums = 0
 
         # reset threshhold and cwnd in fast_recovery state
         if self.curr_state == self.states[2]:
